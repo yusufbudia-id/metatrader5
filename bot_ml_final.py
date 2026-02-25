@@ -30,17 +30,12 @@ loss_count = 0
 def get_pip_unit(digits):
     return 0.01 if digits in [2, 3] else 0.0001
 
-# FIX 2: Confidence-Weighted Position Sizing
 def get_lot_size(equity, sl_dist, confidence, threshold):
     info = mt5.symbol_info(symbol)
     if not info or sl_dist == 0: return 0.01
     
-    # Mencegah division by zero
     if threshold >= 1.0: threshold = 0.99
-    
-    # Edge Factor: Berapa jauh confidence di atas threshold? (Max 1.0)
     edge_factor = (confidence - threshold) / (1.0 - threshold)
-    # Batasi minimal risk 20% dari max risk, maksimal 100%
     edge_factor = max(min(edge_factor, 1.0), 0.2)  
     
     risk_usd = equity * max_risk_percent * edge_factor
@@ -51,7 +46,7 @@ def record_last_trade_result(ticket):
     deals = mt5.history_deals_get(position=ticket)
     if not deals: return 0.0
     total_profit = sum(d.profit for d in deals)
-    if total_profit > 0: return 1.5 # Target RR 1:1.5
+    if total_profit > 0: return 1.5 
     elif total_profit < 0: return -1.0
     return 0.0
 
@@ -90,8 +85,6 @@ def latih_ai_pro():
     df['vol_ratio'] = df['ATRr_14'] / df['ATRr_14'].rolling(100).mean()
     df['roc_10'] = df['close'].pct_change(10)
     df['returns'] = df['close'].pct_change(); df['hour'] = pd.to_datetime(df['time'], unit='s').dt.hour
-    
-    # FIX 1: Market Regime Filter (Trend Strength)
     df['trend_strength'] = abs(df['EMA_50'].pct_change(5)) / df['ATRr_14']
     
     recent_vol = df['ATRr_14'].tail(200).mean()
@@ -174,14 +167,26 @@ while True:
         if new_m: model_ai, features, threshold, current_edge, last_train = new_m, new_f, new_t, new_e, datetime.now()
         time.sleep(60); continue
 
-    # FIX 3: Event-Driven Retraining Logic (Hanya retrain jika loss banyak atau edge hancur)
-    if loss_count >= 3 or current_edge < -0.05:
-        print(f"!!! Event-Triggered Retrain (Losses: {loss_count}, Edge: {current_edge:.4f}) !!!")
+    # ==========================================
+    # HOTFIX V17.1: ANTI-SPAM & NEGATIVE EDGE LOCK
+    # ==========================================
+    time_since_train = (datetime.now() - last_train).total_seconds()
+    
+    # Hanya trigger retrain jika sudah minimal 1 jam berlalu (mencegah loop panik)
+    if loss_count >= 3 or (current_edge < -0.05 and time_since_train > 3600):
+        print(f"\n!!! Event-Triggered Retrain (Losses: {loss_count}, Edge: {current_edge:.4f}) !!!")
         new_m, new_f, new_t, new_e = latih_ai_pro()
         if new_m: 
             model_ai, features, threshold, current_edge = new_m, new_f, new_t, new_e
             last_train = datetime.now()
-            loss_count = 0 # Reset loss count setelah belajar ulang
+            loss_count = 0 
+
+    # JIKA EDGE NEGATIF = ROBOT TIDUR. DILARANG TRADING.
+    if current_edge < 0:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] STRATEGY OFFLINE: Edge Negatif ({current_edge:.4f}R). Market tidak kondusif. Sleep 1 jam...")
+        time.sleep(3600) # Tidur 1 Jam
+        continue # Lewati logika trading di bawah ini
+    # ==========================================
 
     pos = mt5.positions_get(symbol=symbol)
     curr_bar_time = mt5.copy_rates_from_pos(symbol, timeframe, 0, 1)[0][0]
@@ -214,7 +219,6 @@ while True:
         df_l['roc_10'] = df_l['close'].pct_change(10)
         df_l['hour'] = pd.to_datetime(df_l['time'], unit='s').dt.hour; df_l['returns'] = df_l['close'].pct_change()
         
-        # Kalkulasi Trend Strength Live
         df_l['trend_strength'] = abs(df_l['EMA_50'].pct_change(5)) / df_l['ATRr_14']
         
         atr_now = df_l['ATRr_14'].iloc[-1]
@@ -223,7 +227,6 @@ while True:
         if pd.notna(long_term_atr) and atr_now < long_term_atr * 0.5:
             time.sleep(10); continue
 
-        # FIX 1: Market Regime Execution Filter (NO TRADE ZONE)
         trend_strength_now = df_l['trend_strength'].iloc[-1]
         if pd.notna(trend_strength_now) and trend_strength_now < 0.15:
             time.sleep(10); continue
@@ -245,7 +248,6 @@ while True:
             action = "BUY" if pred == 1 else "SELL"
             price = tick.ask if action == "BUY" else tick.bid
             
-            # Eksekusi dengan Confidence-Weighted Lot Size
             lot_size = get_lot_size(acc_info.equity, sl_dist, conf, adaptive_threshold)
             
             res = mt5.order_send({
